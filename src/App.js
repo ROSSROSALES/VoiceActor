@@ -9,6 +9,7 @@ export default function AnimeVASearch() {
   const [selectedVA, setSelectedVA] = useState(null);
   const [vaDetails, setVADetails] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [vaRolesLoading, setVARolesLoading] = useState(false);
   const [loadingMessage, setLoadingMessage] = useState('');
   const [error, setError] = useState(null);
   const [view, setView] = useState('search');
@@ -201,23 +202,32 @@ export default function AnimeVASearch() {
       const res = await fetch(`https://api.jikan.moe/v4/people/${mal_id}/full`);
       const data = await res.json();
 
-      const sortedRoles = await fetchRolesWithFavorites(
-        data.data.voices || [],
-        20,
-        null,
-        (start, end, total) =>
-          setLoadingMessage(`Loading characters ${start}–${end} of ${total}...`)
-      );
+      // Show profile immediately — don't wait for roles
+      setVADetails({ ...data.data, voices: [] });
+      setLoading(false);
+      setVARolesLoading(true);
 
-      setLoadingMessage('');
-      const vaData = { ...data.data, voices: sortedRoles || [] };
-      vaDetailsCacheRef.current[mal_id] = vaData; // cache for instant back-navigation
-      setVADetails(vaData);
+      try {
+        const sortedRoles = await fetchRolesWithFavorites(
+          data.data.voices || [],
+          20,
+          null,
+          (start, end, total) =>
+            setLoadingMessage(`Loading popular roles ${start}–${end} of ${total}...`)
+        );
+        const vaData = { ...data.data, voices: sortedRoles || [] };
+        vaDetailsCacheRef.current[mal_id] = vaData;
+        setVADetails(vaData);
+      } catch {
+        // Profile loaded fine — show it without roles rather than erroring
+      } finally {
+        setVARolesLoading(false);
+        setLoadingMessage('');
+      }
     } catch (err) {
-      setLoadingMessage('');
+      setLoading(false);
       setError('Failed to load voice actor details. Please try again.');
     }
-    setLoading(false);
   };
 
   const resetSearch = () => {
@@ -231,6 +241,7 @@ export default function AnimeVASearch() {
     setVADetails(null);
     setError(null);
     setLoadingMessage('');
+    setVARolesLoading(false);
   };
 
   return (
@@ -408,32 +419,55 @@ export default function AnimeVASearch() {
 
             <h3 className="text-xl font-bold text-white mb-4 flex items-center gap-2">
               <Tv size={20} />
-              Popular Roles ({vaDetails.voices?.length || 0})
+              Popular Roles {!vaRolesLoading && `(${vaDetails.voices?.length || 0})`}
+              {vaRolesLoading && (
+                <span className="flex items-center gap-1.5 text-purple-300 text-sm font-normal ml-1">
+                  <span className="inline-block w-3 h-3 border-2 border-purple-400 border-t-transparent rounded-full animate-spin" />
+                  {loadingMessage || 'loading...'}
+                </span>
+              )}
             </h3>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              {vaDetails.voices
-                ?.slice(0, 12)
-                .map((role, idx) => (
-                <div key={idx} className="bg-white/10 backdrop-blur-md rounded-lg p-4 border border-white/20">
-                  <div className="flex gap-3">
-                    <img
-                      src={role.character.images.jpg.image_url}
-                      alt={role.character.name}
-                      className="w-16 h-16 object-cover rounded"
-                    />
-                    <div className="flex-1 min-w-0">
-                      <h4 className="text-white font-semibold text-sm truncate">{role.character.name}</h4>
-                      <p className="text-purple-200 text-xs truncate">{role.anime.title}</p>
-                      <p className="text-purple-300 text-xs">{role.role}</p>
-                      {role.character.favorites > 0 && (
-                        <p className="text-yellow-300 text-xs">♥ {role.character.favorites.toLocaleString()} favorites</p>
-                      )}
+            {vaRolesLoading && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                {Array.from({ length: 12 }).map((_, idx) => (
+                  <div key={idx} className="bg-white/10 backdrop-blur-md rounded-lg p-4 border border-white/20 animate-pulse">
+                    <div className="flex gap-3">
+                      <div className="w-16 h-16 bg-white/20 rounded flex-shrink-0" />
+                      <div className="flex-1 space-y-2 pt-1">
+                        <div className="h-3 bg-white/20 rounded w-3/4" />
+                        <div className="h-3 bg-white/20 rounded w-1/2" />
+                        <div className="h-3 bg-white/20 rounded w-1/4" />
+                      </div>
                     </div>
                   </div>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            )}
+
+            {!vaRolesLoading && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                {vaDetails.voices?.slice(0, 12).map((role, idx) => (
+                  <div key={idx} className="bg-white/10 backdrop-blur-md rounded-lg p-4 border border-white/20">
+                    <div className="flex gap-3">
+                      <img
+                        src={role.character.images.jpg.image_url}
+                        alt={role.character.name}
+                        className="w-16 h-16 object-cover rounded"
+                      />
+                      <div className="flex-1 min-w-0">
+                        <h4 className="text-white font-semibold text-sm truncate">{role.character.name}</h4>
+                        <p className="text-purple-200 text-xs truncate">{role.anime.title}</p>
+                        <p className="text-purple-300 text-xs">{role.role}</p>
+                        {role.character.favorites > 0 && (
+                          <p className="text-yellow-300 text-xs">♥ {role.character.favorites.toLocaleString()} favorites</p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 
