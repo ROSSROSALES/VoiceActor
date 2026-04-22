@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import { Search, User, Tv, ChevronRight } from 'lucide-react';
 
 export default function AnimeVASearch() {
@@ -6,7 +6,6 @@ export default function AnimeVASearch() {
   const [searchResults, setSearchResults] = useState([]);
   const [selectedAnime, setSelectedAnime] = useState(null);
   const [characters, setCharacters] = useState([]);
-  const [characterFavoritesCache, setCharacterFavoritesCache] = useState({});
   const [selectedVA, setSelectedVA] = useState(null);
   const [vaDetails, setVADetails] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -14,9 +13,14 @@ export default function AnimeVASearch() {
   const [error, setError] = useState(null);
   const [view, setView] = useState('search');
 
+  // Refs keep cache values current inside async callbacks (avoids stale closure on useState).
+  const characterFavoritesCacheRef = useRef({});
+  const vaDetailsCacheRef = useRef({});
+  // Flip to true to stop a running background prefetch immediately.
+  const prefetchAbortRef = useRef(false);
+
   const searchAnime = async () => {
     if (!searchTerm.trim()) return;
-
     setLoading(true);
     setError(null);
     try {
@@ -31,6 +35,7 @@ export default function AnimeVASearch() {
   };
 
   const selectAnime = async (anime) => {
+    prefetchAbortRef.current = true; // stop any prefetch from a previous anime
     setSelectedAnime(anime);
     setLoading(true);
     setError(null);
@@ -39,7 +44,9 @@ export default function AnimeVASearch() {
     try {
       const res = await fetch(`https://api.jikan.moe/v4/anime/${anime.mal_id}/characters`);
       const data = await res.json();
-      setCharacters(data.data || []);
+      const chars = data.data || [];
+      setCharacters(chars);
+      prefetchVAsForAnime(chars); // fire-and-forget background prefetch
     } catch (err) {
       setError('Failed to load characters. Please try again.');
     }
@@ -51,7 +58,6 @@ export default function AnimeVASearch() {
       try {
         const res = await fetch(url);
         if (res.status === 429) {
-          // Rate limited, wait longer and retry
           await new Promise(resolve => setTimeout(resolve, 3000 * (i + 1)));
           continue;
         }
@@ -64,68 +70,149 @@ export default function AnimeVASearch() {
     throw new Error('Max retries reached');
   };
 
+  // Fetches character favorites for up to maxRoles roles in batches of 3.
+  // abortRef: pass prefetchAbortRef for background use; null for foreground (never aborts).
+  // onProgress: optional callback(batchStart, batchEnd, total) for UI progress updates.
+  // Returns sorted roles array, or null if aborted mid-flight.
+  const fetchRolesWithFavorites = async (rawRoles, maxRoles, abortRef, onProgress) => {
+    const uniqueRoles = rawRoles.filter((role, idx, arr) =>
+      arr.findIndex(r => r.character.mal_id === role.character.mal_id) === idx
+    );
+    const targetRoles = uniqueRoles.slice(0, maxRoles);
+
+    const BATCH_SIZE = 3;
+    const BATCH_DELAY_MS = 1100;
+    const rolesWithFavorites = [];
+
+    for (let batchIndex = 0; batchIndex < targetRoles.length; batchIndex += BATCH_SIZE) {
+      if (abortRef?.current) return null;
+
+      const batch = targetRoles.slice(batchIndex, batchIndex + BATCH_SIZE);
+      const batchStart = batchIndex + 1;
+      const batchEnd = Math.min(batchIndex + BATCH_SIZE, targetRoles.length);
+
+      if (onProgress) onProgress(batchStart, batchEnd, targetRoles.length);
+
+      const batchResults = await Promise.all(
+        batch.map(async (role) => {
+          const cached = characterFavoritesCacheRef.current[role.character.mal_id];
+          if (cached !== undefined) {
+            return { ...role, character: { ...role.character, favorites: cached } };
+          }
+          try {
+            const charRes = await fetchWithRetry(
+              `https://api.jikan.moe/v4/characters/${role.character.mal_id}/full`
+            );
+            const charData = await charRes.json();
+            const favorites = charData.data.favorites || 0;
+            characterFavoritesCacheRef.current[role.character.mal_id] = favorites;
+            return { ...role, character: { ...role.character, favorites } };
+          } catch {
+            return { ...role, character: { ...role.character, favorites: 0 } };
+          }
+        })
+      );
+
+      if (abortRef?.current) return null;
+
+      rolesWithFavorites.push(...batchResults);
+
+      if (batchEnd < targetRoles.length) {
+        await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
+      }
+    }
+
+    return rolesWithFavorites.sort(
+      (a, b) => (b.character.favorites || 0) - (a.character.favorites || 0)
+    );
+  };
+
+  // Background: pre-fetches full VA data for every Japanese VA in the character list.
+  // Main-role VAs are prioritised. Uses 50 roles per VA for more accurate rankings.
+  // Results are stored in vaDetailsCacheRef so selectVA can serve them instantly.
+  //
+  // EXIT PLAN: remove the prefetchVAsForAnime(chars) call in selectAnime to revert to
+  // pure on-demand loading. This function and vaDetailsCacheRef can then be deleted.
+  const prefetchVAsForAnime = async (characters) => {
+    prefetchAbortRef.current = false;
+
+    // Build a queue of unique Japanese VAs, Main characters first
+    const seen = new Set();
+    const vaQueue = [];
+    const prioritized = [...characters].sort((a, b) =>
+      a.role === 'Main' && b.role !== 'Main' ? -1 : b.role === 'Main' ? 1 : 0
+    );
+    for (const char of prioritized) {
+      for (const va of (char.voice_actors || [])) {
+        if (va.language === 'Japanese' && !seen.has(va.person.mal_id)) {
+          seen.add(va.person.mal_id);
+          vaQueue.push(va);
+        }
+      }
+    }
+
+    for (const va of vaQueue) {
+      if (prefetchAbortRef.current) return;
+
+      const mal_id = va.person.mal_id;
+      if (vaDetailsCacheRef.current[mal_id]) continue; // already cached
+
+      try {
+        const res = await fetchWithRetry(`https://api.jikan.moe/v4/people/${mal_id}/full`);
+        if (prefetchAbortRef.current) return;
+
+        const data = await res.json();
+        const sortedRoles = await fetchRolesWithFavorites(
+          data.data.voices || [], 50, prefetchAbortRef, null
+        );
+        if (!sortedRoles || prefetchAbortRef.current) return;
+
+        vaDetailsCacheRef.current[mal_id] = { ...data.data, voices: sortedRoles };
+      } catch {
+        // Skip this VA on error and continue to the next
+      }
+
+      if (!prefetchAbortRef.current) {
+        await new Promise(resolve => setTimeout(resolve, 600));
+      }
+    }
+  };
+
   const selectVA = async (va, charName) => {
+    const mal_id = va.person.mal_id;
+
+    // Instant render: VA was pre-fetched in the background
+    if (vaDetailsCacheRef.current[mal_id]) {
+      setSelectedVA({ ...va, charName });
+      setVADetails(vaDetailsCacheRef.current[mal_id]);
+      setView('va');
+      return;
+    }
+
+    // Cache miss: stop background prefetch so it doesn't compete for rate-limit
+    // bandwidth, then do a focused on-demand fetch for just this VA.
+    prefetchAbortRef.current = true;
     setSelectedVA({ ...va, charName });
     setLoading(true);
     setError(null);
     setView('va');
 
     try {
-      const res = await fetch(`https://api.jikan.moe/v4/people/${va.person.mal_id}/full`);
+      const res = await fetch(`https://api.jikan.moe/v4/people/${mal_id}/full`);
       const data = await res.json();
 
-      const uniqueRoles = data.data.voices
-        ?.filter((role, idx, arr) =>
-          arr.findIndex(r => r.character.mal_id === role.character.mal_id) === idx
-        ) || [];
-
-      const topRoles = uniqueRoles.slice(0, 20);
-
-      const BATCH_SIZE = 3;
-      const BATCH_DELAY_MS = 1100;
-      const rolesWithFavorites = [];
-
-      for (let batchIndex = 0; batchIndex < topRoles.length; batchIndex += BATCH_SIZE) {
-        const batch = topRoles.slice(batchIndex, batchIndex + BATCH_SIZE);
-        const batchStart = batchIndex + 1;
-        const batchEnd = Math.min(batchIndex + BATCH_SIZE, topRoles.length);
-        setLoadingMessage(`Loading characters ${batchStart}–${batchEnd} of ${topRoles.length}...`);
-
-        const batchResults = await Promise.all(
-          batch.map(async (role) => {
-            if (characterFavoritesCache[role.character.mal_id] !== undefined) {
-              return {
-                ...role,
-                character: { ...role.character, favorites: characterFavoritesCache[role.character.mal_id] }
-              };
-            }
-            try {
-              const charRes = await fetchWithRetry(
-                `https://api.jikan.moe/v4/characters/${role.character.mal_id}/full`
-              );
-              const charData = await charRes.json();
-              const favorites = charData.data.favorites || 0;
-              setCharacterFavoritesCache(prev => ({ ...prev, [role.character.mal_id]: favorites }));
-              return { ...role, character: { ...role.character, favorites } };
-            } catch {
-              return { ...role, character: { ...role.character, favorites: 0 } };
-            }
-          })
-        );
-
-        rolesWithFavorites.push(...batchResults);
-
-        if (batchEnd < topRoles.length) {
-          await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
-        }
-      }
-
-      const sortedByFavorites = rolesWithFavorites.sort(
-        (a, b) => (b.character.favorites || 0) - (a.character.favorites || 0)
+      const sortedRoles = await fetchRolesWithFavorites(
+        data.data.voices || [],
+        20,
+        null,
+        (start, end, total) =>
+          setLoadingMessage(`Loading characters ${start}–${end} of ${total}...`)
       );
 
       setLoadingMessage('');
-      setVADetails({ ...data.data, voices: sortedByFavorites });
+      const vaData = { ...data.data, voices: sortedRoles || [] };
+      vaDetailsCacheRef.current[mal_id] = vaData; // cache for instant back-navigation
+      setVADetails(vaData);
     } catch (err) {
       setLoadingMessage('');
       setError('Failed to load voice actor details. Please try again.');
@@ -134,6 +221,7 @@ export default function AnimeVASearch() {
   };
 
   const resetSearch = () => {
+    prefetchAbortRef.current = true; // stop any running prefetch
     setView('search');
     setSearchTerm('');
     setSearchResults([]);
@@ -250,7 +338,7 @@ export default function AnimeVASearch() {
               <User size={20} />
               Characters & Voice Actors
             </h3>
-            
+
             <div className="space-y-3">
               {characters.filter(c => c.voice_actors?.length > 0).map((char) => (
                 <div key={char.character.mal_id} className="bg-white/10 backdrop-blur-md rounded-lg p-4 border border-white/20">
@@ -265,7 +353,7 @@ export default function AnimeVASearch() {
                       <p className="text-purple-200 text-sm">{char.role}</p>
                     </div>
                   </div>
-                  
+
                   <div className="space-y-2 pl-4">
                     {char.voice_actors.filter(va => va.language === 'Japanese').map((va) => (
                       <div
