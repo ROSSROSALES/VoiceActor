@@ -79,7 +79,7 @@ export default function AnimeVASearch() {
           arr.findIndex(r => r.character.mal_id === role.character.mal_id) === idx
         ) || [];
 
-      const topRoles = uniqueRoles.slice(0, 30);
+      const topRoles = uniqueRoles.slice(0, 20);
 
       const BATCH_SIZE = 3;
       const BATCH_DELAY_MS = 1100;
