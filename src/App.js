@@ -10,19 +10,22 @@ export default function AnimeVASearch() {
   const [selectedVA, setSelectedVA] = useState(null);
   const [vaDetails, setVADetails] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [loadingMessage, setLoadingMessage] = useState('');
+  const [error, setError] = useState(null);
   const [view, setView] = useState('search');
 
   const searchAnime = async () => {
     if (!searchTerm.trim()) return;
-    
+
     setLoading(true);
+    setError(null);
     try {
       const res = await fetch(`https://api.jikan.moe/v4/anime?q=${encodeURIComponent(searchTerm)}&limit=10`);
       const data = await res.json();
       setSearchResults(data.data || []);
       setView('results');
     } catch (err) {
-      console.error('Search error:', err);
+      setError('Failed to search anime. Please try again.');
     }
     setLoading(false);
   };
@@ -30,16 +33,15 @@ export default function AnimeVASearch() {
   const selectAnime = async (anime) => {
     setSelectedAnime(anime);
     setLoading(true);
+    setError(null);
     setView('anime');
-    
+
     try {
-      await new Promise(resolve => setTimeout(resolve, 350));
       const res = await fetch(`https://api.jikan.moe/v4/anime/${anime.mal_id}/characters`);
       const data = await res.json();
       setCharacters(data.data || []);
-      
     } catch (err) {
-      console.error('Character fetch error:', err);
+      setError('Failed to load characters. Please try again.');
     }
     setLoading(false);
   };
@@ -63,88 +65,73 @@ export default function AnimeVASearch() {
   };
 
   const selectVA = async (va, charName) => {
-  console.log('selectVA');
-  setSelectedVA({ ...va, charName });
-  setLoading(true);
-  setView('va');
-  
-  try {
-    // Wait 1.5 seconds before starting to let any rate limits clear
-    await new Promise(resolve => setTimeout(resolve, 500));
-    console.log('Starting to fetch voice actor data...');
-    
-    const res = await fetch(`https://api.jikan.moe/v4/people/${va.person.mal_id}/full`);
-    const data = await res.json();
-    console.log('Voice actor data loaded');
-    
-    // Remove duplicates and sort by role importance (Main first, then Supporting)
-    const uniqueRoles = data.data.voices
-      ?.filter((role, idx, arr) =>    
-        arr.findIndex(r => r.character.mal_id === role.character.mal_id) === idx
-      ) || [];
-    
-    // Take top 30 main/supporting roles
-    const topRoles = uniqueRoles.slice(0, 30);
-    console.log(`Found ${topRoles.length} top roles to fetch`);
-    
-    // Fetch character favorites for these top roles
-    const rolesWithFavorites = [];
-    for (let i = 0; i < topRoles.length; i++) {
-      const role = topRoles[i];
-      console.log(`Fetching character ${i + 1}/${topRoles.length}: ${role.character.name}`);
-      
-      // Check cache first
-      if (characterFavoritesCache[role.character.mal_id] !== undefined) {
-        console.log(`✓ Using cached data for ${role.character.name}`);
-        rolesWithFavorites.push({
-          ...role,
-          character: {
-            ...role.character,
-            favorites: characterFavoritesCache[role.character.mal_id]
-          }
-        });
-      } else {
-        // Wait 0.4 seconds before each request
-        console.log(`Waiting 0.5 seconds before fetching...`);
-        await new Promise(resolve => setTimeout(resolve, 400));
-        
-        // Fetch if not in cache
-        try {
-          //console.log(`Fetching from API: ${role.character.mal_id}`);
-          const charRes = await fetchWithRetry(`https://api.jikan.moe/v4/characters/${role.character.mal_id}/full`);
-          const charData = await charRes.json();
-          const favorites = charData.data.favorites || 0;
-          setCharacterFavoritesCache(prev => ({ ...prev, [role.character.mal_id]: favorites }));
-          rolesWithFavorites.push({
-            ...role,
-            character: {
-              ...role.character,
-              favorites
+    setSelectedVA({ ...va, charName });
+    setLoading(true);
+    setError(null);
+    setView('va');
+
+    try {
+      const res = await fetch(`https://api.jikan.moe/v4/people/${va.person.mal_id}/full`);
+      const data = await res.json();
+
+      const uniqueRoles = data.data.voices
+        ?.filter((role, idx, arr) =>
+          arr.findIndex(r => r.character.mal_id === role.character.mal_id) === idx
+        ) || [];
+
+      const topRoles = uniqueRoles.slice(0, 20);
+
+      const BATCH_SIZE = 3;
+      const BATCH_DELAY_MS = 1100;
+      const rolesWithFavorites = [];
+
+      for (let batchIndex = 0; batchIndex < topRoles.length; batchIndex += BATCH_SIZE) {
+        const batch = topRoles.slice(batchIndex, batchIndex + BATCH_SIZE);
+        const batchStart = batchIndex + 1;
+        const batchEnd = Math.min(batchIndex + BATCH_SIZE, topRoles.length);
+        setLoadingMessage(`Loading characters ${batchStart}–${batchEnd} of ${topRoles.length}...`);
+
+        const batchResults = await Promise.all(
+          batch.map(async (role) => {
+            if (characterFavoritesCache[role.character.mal_id] !== undefined) {
+              return {
+                ...role,
+                character: { ...role.character, favorites: characterFavoritesCache[role.character.mal_id] }
+              };
             }
-          });
-          console.log(`✓ Fetched ${role.character.name}: ${favorites} favorites`);
-        } catch (err) {
-          console.error(`✗ Error fetching character ${role.character.name}:`, err);
-          rolesWithFavorites.push({ ...role, character: { ...role.character, favorites: 0 } });
+            try {
+              const charRes = await fetchWithRetry(
+                `https://api.jikan.moe/v4/characters/${role.character.mal_id}/full`
+              );
+              const charData = await charRes.json();
+              const favorites = charData.data.favorites || 0;
+              setCharacterFavoritesCache(prev => ({ ...prev, [role.character.mal_id]: favorites }));
+              return { ...role, character: { ...role.character, favorites } };
+            } catch {
+              return { ...role, character: { ...role.character, favorites: 0 } };
+            }
+          })
+        );
+
+        rolesWithFavorites.push(...batchResults);
+
+        if (batchEnd < topRoles.length) {
+          await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
         }
       }
+
+      const sortedByFavorites = rolesWithFavorites.sort(
+        (a, b) => (b.character.favorites || 0) - (a.character.favorites || 0)
+      );
+
+      setLoadingMessage('');
+      setVADetails({ ...data.data, voices: sortedByFavorites });
+    } catch (err) {
+      setLoadingMessage('');
+      setError('Failed to load voice actor details. Please try again.');
     }
-    
-    // Sort by character favorites
-    const sortedByFavorites = rolesWithFavorites.sort((a, b) => {
-      return (b.character.favorites || 0) - (a.character.favorites || 0);
-    });
-    
-    console.log('All characters loaded and sorted!');
-    setVADetails({
-      ...data.data,
-      voices: sortedByFavorites
-    });
-  } catch (err) {
-    console.error('VA fetch error:', err);
-  }
-  setLoading(false);
-};
+    setLoading(false);
+  };
 
   const resetSearch = () => {
     setView('search');
@@ -152,9 +139,10 @@ export default function AnimeVASearch() {
     setSearchResults([]);
     setSelectedAnime(null);
     setCharacters([]);
-    setCharacterFavoritesCache({});
     setSelectedVA(null);
     setVADetails(null);
+    setError(null);
+    setLoadingMessage('');
   };
 
   return (
@@ -174,7 +162,7 @@ export default function AnimeVASearch() {
                 type="text"
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
-                onKeyPress={(e) => e.key === 'Enter' && searchAnime()}
+                onKeyDown={(e) => e.key === 'Enter' && searchAnime()}
                 placeholder="Search for an anime..."
                 className="w-full px-4 py-3 pl-12 rounded-lg bg-white/10 backdrop-blur-md border border-white/20 text-white placeholder-purple-200 focus:outline-none focus:ring-2 focus:ring-purple-400"
               />
@@ -202,7 +190,14 @@ export default function AnimeVASearch() {
         {loading && (
           <div className="text-center py-12">
             <div className="inline-block animate-spin rounded-full h-12 w-12 border-4 border-purple-400 border-t-transparent"></div>
-            <p className="text-purple-200 mt-4">Loading...</p>
+            <p className="text-purple-200 mt-4">{loadingMessage || 'Loading...'}</p>
+          </div>
+        )}
+
+        {/* Error */}
+        {error && !loading && (
+          <div className="bg-red-500/20 border border-red-400/40 rounded-lg p-4 mb-4">
+            <p className="text-red-200 text-sm">{error}</p>
           </div>
         )}
 
@@ -330,15 +325,7 @@ export default function AnimeVASearch() {
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               {vaDetails.voices
-                ?.sort((a, b) => {
-                  const favoritesA = a.character.favorites || 0;
-                  const favoritesB = b.character.favorites || 0;
-                  return favoritesB - favoritesA;
-                })
-                .filter((role, idx, arr) => 
-                  arr.findIndex(r => r.character.mal_id === role.character.mal_id) === idx
-                )
-                .slice(0, 12)
+                ?.slice(0, 12)
                 .map((role, idx) => (
                 <div key={idx} className="bg-white/10 backdrop-blur-md rounded-lg p-4 border border-white/20">
                   <div className="flex gap-3">
